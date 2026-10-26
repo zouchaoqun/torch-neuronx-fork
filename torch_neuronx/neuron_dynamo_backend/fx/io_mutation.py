@@ -96,11 +96,32 @@ class PassMutations:
     output_mutations: list[IOMutation] = field(default_factory=list)
 
 
+# Reuse one tensor for each (device, stream, shard index). A new tensor at each call is a
+# host-to-device write. The in-order queue runs it after the previous graph, so the next graph
+# cannot be submitted early. The first upload is asynchronous on the current stream. Only graphs
+# on that stream are ordered after it.
+_SHARD_INDEX_TENSORS: dict[tuple[str, int | None, int], torch.Tensor] = {}
+
+
+def _current_stream_id(device: str) -> int | None:
+    """Return the id of the current stream on a Neuron ``device``, ``None`` for other devices."""
+    if torch.device(device).type != "neuron":
+        return None
+    return torch.neuron.current_stream(device).stream_id
+
+
+def _shard_index_tensor(index, device, params, original_inputs):
+    """Return the cached int64 scalar tensor holding ``params["shard_index"]`` on ``device``."""
+    key = (str(device), _current_stream_id(device), int(params["shard_index"]))
+    tensor = _SHARD_INDEX_TENSORS.get(key)
+    if tensor is None:
+        tensor = _SHARD_INDEX_TENSORS[key] = torch.tensor(key[2], dtype=torch.int64, device=device)
+    return tensor
+
+
 TRANSFORM_REGISTRY: dict[str, Callable[[int, str, dict, list], Any]] = {
     "none": lambda index, device, params, original_inputs: None,
-    "shard_index": lambda index, device, params, original_inputs: torch.tensor(
-        params["shard_index"], dtype=torch.int64, device=device
-    ),
+    "shard_index": _shard_index_tensor,
     "input_passthrough": lambda index, device, params, original_inputs: (
         original_inputs[params["index_to_input"][index]] if original_inputs is not None else None
     ),

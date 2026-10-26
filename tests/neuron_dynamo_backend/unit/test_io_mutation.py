@@ -12,6 +12,7 @@ Organised into:
 import pytest
 import torch
 
+from torch_neuronx.neuron_dynamo_backend.fx import io_mutation
 from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
     IOMutation,
     MutationKind,
@@ -196,6 +197,43 @@ def test_apply_input_mutations_add_shard():
     passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 5})])]
     result = apply_input_mutations(["a", "b"], passes, "cpu")
     assert result[0] == "a" and result[1] == "b" and result[2].item() == 5
+
+
+def test_apply_input_mutations_shard_index_reused():
+    passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 3})])]
+    first = apply_input_mutations(["a", "b"], passes, "cpu")[2]
+    second = apply_input_mutations(["a", "b"], passes, "cpu")[2]
+    assert first is second and first.dtype == torch.int64 and first.item() == 3
+    other = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 4})])]
+    assert apply_input_mutations(["a", "b"], other, "cpu")[2].item() == 4
+
+
+def test_apply_input_mutations_shard_index_per_stream(monkeypatch):
+    passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 6})])]
+    monkeypatch.setattr(io_mutation, "_current_stream_id", lambda device: 1)
+    first = apply_input_mutations(["a", "b"], passes, "cpu")[2]
+    monkeypatch.setattr(io_mutation, "_current_stream_id", lambda device: 2)
+    second = apply_input_mutations(["a", "b"], passes, "cpu")[2]
+    assert first is not second and second.item() == 6
+    assert apply_input_mutations(["a", "b"], passes, "cpu")[2] is second
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+def test_apply_input_mutations_shard_index_two_neuron_streams():
+    # The first upload is asynchronous on the current stream. Each stream must get its own tensor.
+    passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 7})])]
+    device = f"neuron:{torch.neuron.current_device()}"
+    streams = [torch.neuron.Stream(), torch.neuron.Stream()]
+    tensors = []
+    for stream in streams:
+        with torch.neuron.stream(stream):
+            tensors.append(apply_input_mutations(["a", "b"], passes, device)[2])
+            assert apply_input_mutations(["a", "b"], passes, device)[2] is tensors[-1]
+    assert tensors[0] is not tensors[1]
+    for stream, tensor in zip(streams, tensors, strict=True):
+        with torch.neuron.stream(stream):
+            assert tensor.device.type == "neuron" and tensor.dtype == torch.int64
+            assert tensor.item() == 7
 
 
 def test_apply_input_mutations_multi_pass():
