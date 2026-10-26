@@ -20,6 +20,7 @@ entries applying each pass's input mutations in order.
 mutations in reverse order (last pass undone first).
 """
 
+import functools
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -99,8 +100,9 @@ class PassMutations:
 # Reuse one tensor for each (device, stream, shard index). A new tensor at each call is a
 # host-to-device write. The in-order queue runs it after the previous graph, so the next graph
 # cannot be submitted early. The first upload is asynchronous on the current stream. Only graphs
-# on that stream are ordered after it.
-_SHARD_INDEX_TENSORS: dict[tuple[str, int | None, int], torch.Tensor] = {}
+# on that stream are ordered after it. Each new stream gets a new id, so the cache is an LRU of
+# fixed size. An evicted tensor is released as the per-call tensor was before.
+_SHARD_INDEX_CACHE_SIZE = 16
 
 
 def _current_stream_id(device: str) -> int | None:
@@ -110,13 +112,14 @@ def _current_stream_id(device: str) -> int | None:
     return torch.neuron.current_stream(device).stream_id
 
 
+@functools.lru_cache(maxsize=_SHARD_INDEX_CACHE_SIZE)
+def _shard_index_on(device: str, stream_id: int | None, shard_index: int) -> torch.Tensor:
+    return torch.tensor(shard_index, dtype=torch.int64, device=device)
+
+
 def _shard_index_tensor(index, device, params, original_inputs):
     """Return the cached int64 scalar tensor holding ``params["shard_index"]`` on ``device``."""
-    key = (str(device), _current_stream_id(device), int(params["shard_index"]))
-    tensor = _SHARD_INDEX_TENSORS.get(key)
-    if tensor is None:
-        tensor = _SHARD_INDEX_TENSORS[key] = torch.tensor(key[2], dtype=torch.int64, device=device)
-    return tensor
+    return _shard_index_on(str(device), _current_stream_id(device), int(params["shard_index"]))
 
 
 TRANSFORM_REGISTRY: dict[str, Callable[[int, str, dict, list], Any]] = {

@@ -9,6 +9,9 @@ Organised into:
        - get_alias_output_buffer_map and get_mutation_copy_back_inputs
 """
 
+import gc
+import weakref
+
 import pytest
 import torch
 
@@ -218,9 +221,24 @@ def test_apply_input_mutations_shard_index_per_stream(monkeypatch):
     assert apply_input_mutations(["a", "b"], passes, "cpu")[2] is second
 
 
+def test_apply_input_mutations_shard_index_stream_churn(monkeypatch):
+    # Each new stream gets a new id. Discarded streams must not keep their tensors alive.
+    passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 8})])]
+    refs = []
+    for stream_id in range(1000):
+        monkeypatch.setattr(io_mutation, "_current_stream_id", lambda device, s=stream_id: s)
+        refs.append(weakref.ref(apply_input_mutations(["a", "b"], passes, "cpu")[2]))
+    gc.collect()
+    size = io_mutation._SHARD_INDEX_CACHE_SIZE
+    assert io_mutation._shard_index_on.cache_info().currsize <= size
+    assert sum(r() is not None for r in refs) <= size
+    assert refs[-1]() is apply_input_mutations(["a", "b"], passes, "cpu")[2]
+
+
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 def test_apply_input_mutations_shard_index_two_neuron_streams():
     # The first upload is asynchronous on the current stream. Each stream must get its own tensor.
+    # With TORCH_NEURONX_ENABLE_STREAMS=0, both streams are the default stream and share one.
     passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 7})])]
     device = f"neuron:{torch.neuron.current_device()}"
     streams = [torch.neuron.Stream(), torch.neuron.Stream()]
@@ -229,7 +247,8 @@ def test_apply_input_mutations_shard_index_two_neuron_streams():
         with torch.neuron.stream(stream):
             tensors.append(apply_input_mutations(["a", "b"], passes, device)[2])
             assert apply_input_mutations(["a", "b"], passes, device)[2] is tensors[-1]
-    assert tensors[0] is not tensors[1]
+    same_stream = streams[0].stream_id == streams[1].stream_id
+    assert (tensors[0] is tensors[1]) == same_stream
     for stream, tensor in zip(streams, tensors, strict=True):
         with torch.neuron.stream(stream):
             assert tensor.device.type == "neuron" and tensor.dtype == torch.int64
