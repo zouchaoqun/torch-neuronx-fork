@@ -255,6 +255,61 @@ def test_apply_input_mutations_shard_index_two_neuron_streams():
             assert tensor.item() == 7
 
 
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+def test_apply_input_mutations_shard_index_compiled_eviction():
+    # Compiled graphs read the cached tensors while later keys evict them. A backlog keeps the reads
+    # queued. Only the outputs keep a reference, so eviction drops a tensor before its read runs.
+    device = f"neuron:{torch.neuron.current_device()}"
+    matmul = torch.compile(lambda a: a @ a, backend="neuron", fullgraph=True, dynamic=False)
+    add = torch.compile(lambda x, i: x + i, backend="neuron", fullgraph=True, dynamic=False)
+    x = torch.arange(4, dtype=torch.float32, device=device)
+    busy = torch.full((2048, 2048), 1 / 2048, device=device)
+    add(x, torch.tensor(0, device=device))
+    matmul(busy)
+    torch.neuron.synchronize()
+    # Three streams: the key that evicts an entry is on a different stream than the entry.
+    streams = [torch.neuron.Stream() for _ in range(3)]
+    for stream in streams:
+        with torch.neuron.stream(stream):
+            out = busy
+            for _ in range(32):
+                out = matmul(out)
+    outputs = []
+    for k in range(2 * io_mutation._SHARD_INDEX_CACHE_SIZE + 4):
+        stream = streams[k % len(streams)]
+        passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": k})])]
+        with torch.neuron.stream(stream):
+            outputs.append((stream, add(x, apply_input_mutations(["a", "b"], passes, device)[2])))
+    assert io_mutation._shard_index_on.cache_info().currsize <= io_mutation._SHARD_INDEX_CACHE_SIZE
+    assert not all(stream.query() for stream in streams), "the reads were not in flight"
+    torch.neuron.synchronize()
+    for k, (stream, output) in enumerate(outputs):
+        with torch.neuron.stream(stream):
+            assert torch.equal(output.cpu(), torch.arange(4, dtype=torch.float32) + k)
+
+
+@pytest.mark.skipif(
+    not torch.neuron.is_available() or torch.neuron.device_count() < 2,
+    reason="Two Neuron devices not available",
+)
+def test_apply_input_mutations_shard_index_two_devices():
+    passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 5})])]
+    tensors = [apply_input_mutations(["a", "b"], passes, f"neuron:{d}")[2] for d in (0, 1)]
+    assert tensors[0] is not tensors[1]
+    for d, tensor in enumerate(tensors):
+        assert apply_input_mutations(["a", "b"], passes, f"neuron:{d}")[2] is tensor
+        assert tensor.device == torch.device("neuron", d) and tensor.item() == 5
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+def test_apply_input_mutations_shard_index_device_without_index():
+    # A device without an index is the current device. It must not get a key of its own.
+    passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 9})])]
+    device = f"neuron:{torch.neuron.current_device()}"
+    tensor = apply_input_mutations(["a", "b"], passes, device)[2]
+    assert apply_input_mutations(["a", "b"], passes, "neuron")[2] is tensor
+
+
 def test_apply_input_mutations_multi_pass():
     passes = [
         pm("P1", in_muts=[inp_remove([1])]),

@@ -98,10 +98,13 @@ class PassMutations:
 
 
 # Reuse one tensor for each (device, stream, shard index). A new tensor at each call is a
-# host-to-device write. The in-order queue runs it after the previous graph, so the next graph
-# cannot be submitted early. The first upload is asynchronous on the current stream. Only graphs
-# on that stream are ordered after it. Each new stream gets a new id, so the cache is an LRU of
-# fixed size. An evicted tensor is released as the per-call tensor was before.
+# host-to-device write. Python enqueues the write and the next graph without waiting. The runtime
+# submits a device op on another execution unit only after the previous op retires: the write
+# after the previous graph, then the next graph after the write. The first upload is asynchronous
+# on the current stream. Only graphs on that stream are ordered after it. Each new stream gets a
+# new id, so the cache is an LRU of fixed size. An evicted tensor is released as the per-call
+# tensor was before. The cache is process-wide. With more than 16 keys in use, each call can miss
+# and upload a new tensor again. The results stay the same.
 _SHARD_INDEX_CACHE_SIZE = 16
 
 
@@ -119,7 +122,12 @@ def _shard_index_on(device: str, stream_id: int | None, shard_index: int) -> tor
 
 def _shard_index_tensor(index, device, params, original_inputs):
     """Return the cached int64 scalar tensor holding ``params["shard_index"]`` on ``device``."""
-    return _shard_index_on(str(device), _current_stream_id(device), int(params["shard_index"]))
+    # Stream ids repeat across devices, so a key without the device index can match another device.
+    device = torch.device(device)
+    if device.type == "neuron" and device.index is None:
+        device = torch.device("neuron", torch.neuron.current_device())
+    device = str(device)
+    return _shard_index_on(device, _current_stream_id(device), int(params["shard_index"]))
 
 
 TRANSFORM_REGISTRY: dict[str, Callable[[int, str, dict, list], Any]] = {
