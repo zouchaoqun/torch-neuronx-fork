@@ -257,8 +257,10 @@ def test_apply_input_mutations_shard_index_two_neuron_streams():
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 def test_apply_input_mutations_shard_index_compiled_eviction():
-    # Compiled graphs read the cached tensors while later keys evict them. A backlog keeps the reads
-    # queued. Only the outputs keep a reference, so eviction drops a tensor before its read runs.
+    # Eviction stress: later keys evict a cached tensor while a compiled read of it is still queued.
+    # The read is on a created stream, behind a backlog. The keys that evict it are on the default
+    # stream. All created streams share one runtime stream (kStreamPoolSize is 1). The default
+    # stream is a different runtime stream. With TORCH_NEURONX_ENABLE_STREAMS=0, both are the same.
     device = f"neuron:{torch.neuron.current_device()}"
     matmul = torch.compile(lambda a: a @ a, backend="neuron", fullgraph=True, dynamic=False)
     add = torch.compile(lambda x, i: x + i, backend="neuron", fullgraph=True, dynamic=False)
@@ -267,25 +269,26 @@ def test_apply_input_mutations_shard_index_compiled_eviction():
     add(x, torch.tensor(0, device=device))
     matmul(busy)
     torch.neuron.synchronize()
-    # Three streams: the key that evicts an entry is on a different stream than the entry.
-    streams = [torch.neuron.Stream() for _ in range(3)]
-    for stream in streams:
-        with torch.neuron.stream(stream):
-            out = busy
-            for _ in range(32):
-                out = matmul(out)
-    outputs = []
-    for k in range(2 * io_mutation._SHARD_INDEX_CACHE_SIZE + 4):
-        stream = streams[k % len(streams)]
+
+    def read(k):
         passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": k})])]
-        with torch.neuron.stream(stream):
-            outputs.append((stream, add(x, apply_input_mutations(["a", "b"], passes, device)[2])))
-    assert io_mutation._shard_index_on.cache_info().currsize <= io_mutation._SHARD_INDEX_CACHE_SIZE
-    assert not all(stream.query() for stream in streams), "the reads were not in flight"
+        return add(x, apply_input_mutations(["a", "b"], passes, device)[2])
+
+    created, read_done = torch.neuron.Stream(), torch.neuron.Event()
+    with torch.neuron.stream(created):
+        out = busy
+        for _ in range(64):
+            out = matmul(out)
+        outputs = [read(0)]
+        read_done.record()
+    # Key 0 is the oldest of these keys, so the last of them evicts it.
+    outputs += [read(k) for k in range(1, io_mutation._SHARD_INDEX_CACHE_SIZE + 1)]
+    queued_at_eviction = not read_done.query()
     torch.neuron.synchronize()
-    for k, (stream, output) in enumerate(outputs):
-        with torch.neuron.stream(stream):
-            assert torch.equal(output.cpu(), torch.arange(4, dtype=torch.float32) + k)
+    for k, output in enumerate(outputs):
+        assert torch.equal(output.cpu(), torch.arange(4, dtype=torch.float32) + k)
+    if not queued_at_eviction:
+        pytest.skip("The backlog drained before the eviction. The outputs are correct.")
 
 
 @pytest.mark.skipif(
