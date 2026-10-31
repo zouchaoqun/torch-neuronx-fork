@@ -9,9 +9,13 @@ Organised into:
        - get_alias_output_buffer_map and get_mutation_copy_back_inputs
 """
 
+import gc
+import weakref
+
 import pytest
 import torch
 
+from torch_neuronx.neuron_dynamo_backend.fx import io_mutation
 from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
     IOMutation,
     MutationKind,
@@ -196,6 +200,117 @@ def test_apply_input_mutations_add_shard():
     passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 5})])]
     result = apply_input_mutations(["a", "b"], passes, "cpu")
     assert result[0] == "a" and result[1] == "b" and result[2].item() == 5
+
+
+def test_apply_input_mutations_shard_index_reused():
+    passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 3})])]
+    first = apply_input_mutations(["a", "b"], passes, "cpu")[2]
+    second = apply_input_mutations(["a", "b"], passes, "cpu")[2]
+    assert first is second and first.dtype == torch.int64 and first.item() == 3
+    other = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 4})])]
+    assert apply_input_mutations(["a", "b"], other, "cpu")[2].item() == 4
+
+
+def test_apply_input_mutations_shard_index_per_stream(monkeypatch):
+    passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 6})])]
+    monkeypatch.setattr(io_mutation, "_current_stream_id", lambda device: 1)
+    first = apply_input_mutations(["a", "b"], passes, "cpu")[2]
+    monkeypatch.setattr(io_mutation, "_current_stream_id", lambda device: 2)
+    second = apply_input_mutations(["a", "b"], passes, "cpu")[2]
+    assert first is not second and second.item() == 6
+    assert apply_input_mutations(["a", "b"], passes, "cpu")[2] is second
+
+
+def test_apply_input_mutations_shard_index_stream_churn(monkeypatch):
+    # Each new stream gets a new id. Discarded streams must not keep their tensors alive.
+    passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 8})])]
+    refs = []
+    for stream_id in range(1000):
+        monkeypatch.setattr(io_mutation, "_current_stream_id", lambda device, s=stream_id: s)
+        refs.append(weakref.ref(apply_input_mutations(["a", "b"], passes, "cpu")[2]))
+    gc.collect()
+    size = io_mutation._SHARD_INDEX_CACHE_SIZE
+    assert io_mutation._shard_index_on.cache_info().currsize <= size
+    assert sum(r() is not None for r in refs) <= size
+    assert refs[-1]() is apply_input_mutations(["a", "b"], passes, "cpu")[2]
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+def test_apply_input_mutations_shard_index_two_neuron_streams():
+    # The first upload is asynchronous on the current stream. Each stream must get its own tensor.
+    # With TORCH_NEURONX_ENABLE_STREAMS=0, both streams are the default stream and share one.
+    passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 7})])]
+    device = f"neuron:{torch.neuron.current_device()}"
+    streams = [torch.neuron.Stream(), torch.neuron.Stream()]
+    tensors = []
+    for stream in streams:
+        with torch.neuron.stream(stream):
+            tensors.append(apply_input_mutations(["a", "b"], passes, device)[2])
+            assert apply_input_mutations(["a", "b"], passes, device)[2] is tensors[-1]
+    same_stream = streams[0].stream_id == streams[1].stream_id
+    assert (tensors[0] is tensors[1]) == same_stream
+    for stream, tensor in zip(streams, tensors, strict=True):
+        with torch.neuron.stream(stream):
+            assert tensor.device.type == "neuron" and tensor.dtype == torch.int64
+            assert tensor.item() == 7
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+def test_apply_input_mutations_shard_index_compiled_eviction():
+    # Eviction stress: later keys evict a cached tensor while a compiled read of it is still queued.
+    # The read is on a created stream, behind a backlog. The keys that evict it are on the default
+    # stream. All created streams share one runtime stream (kStreamPoolSize is 1). The default
+    # stream is a different runtime stream. With TORCH_NEURONX_ENABLE_STREAMS=0, both are the same.
+    device = f"neuron:{torch.neuron.current_device()}"
+    matmul = torch.compile(lambda a: a @ a, backend="neuron", fullgraph=True, dynamic=False)
+    add = torch.compile(lambda x, i: x + i, backend="neuron", fullgraph=True, dynamic=False)
+    x = torch.arange(4, dtype=torch.float32, device=device)
+    busy = torch.full((2048, 2048), 1 / 2048, device=device)
+    add(x, torch.tensor(0, device=device))
+    matmul(busy)
+    torch.neuron.synchronize()
+
+    def read(k):
+        passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": k})])]
+        return add(x, apply_input_mutations(["a", "b"], passes, device)[2])
+
+    created, read_done = torch.neuron.Stream(), torch.neuron.Event()
+    with torch.neuron.stream(created):
+        out = busy
+        for _ in range(64):
+            out = matmul(out)
+        outputs = [read(0)]
+        read_done.record()
+    # Key 0 is the oldest of these keys, so the last of them evicts it.
+    outputs += [read(k) for k in range(1, io_mutation._SHARD_INDEX_CACHE_SIZE + 1)]
+    queued_at_eviction = not read_done.query()
+    torch.neuron.synchronize()
+    for k, output in enumerate(outputs):
+        assert torch.equal(output.cpu(), torch.arange(4, dtype=torch.float32) + k)
+    if not queued_at_eviction:
+        pytest.skip("The backlog drained before the eviction. The outputs are correct.")
+
+
+@pytest.mark.skipif(
+    not torch.neuron.is_available() or torch.neuron.device_count() < 2,
+    reason="Two Neuron devices not available",
+)
+def test_apply_input_mutations_shard_index_two_devices():
+    passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 5})])]
+    tensors = [apply_input_mutations(["a", "b"], passes, f"neuron:{d}")[2] for d in (0, 1)]
+    assert tensors[0] is not tensors[1]
+    for d, tensor in enumerate(tensors):
+        assert apply_input_mutations(["a", "b"], passes, f"neuron:{d}")[2] is tensor
+        assert tensor.device == torch.device("neuron", d) and tensor.item() == 5
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+def test_apply_input_mutations_shard_index_device_without_index():
+    # A device without an index is the current device. It must not get a key of its own.
+    passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 9})])]
+    device = f"neuron:{torch.neuron.current_device()}"
+    tensor = apply_input_mutations(["a", "b"], passes, device)[2]
+    assert apply_input_mutations(["a", "b"], passes, "neuron")[2] is tensor
 
 
 def test_apply_input_mutations_multi_pass():

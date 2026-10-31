@@ -20,6 +20,7 @@ entries applying each pass's input mutations in order.
 mutations in reverse order (last pass undone first).
 """
 
+import functools
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -96,11 +97,42 @@ class PassMutations:
     output_mutations: list[IOMutation] = field(default_factory=list)
 
 
+# Reuse one tensor for each (device, stream, shard index). A new tensor at each call is a
+# host-to-device write. Python enqueues the write and the next graph without waiting. The runtime
+# submits a device op on another execution unit only after the previous op retires: the write
+# after the previous graph, then the next graph after the write. The first upload is asynchronous
+# on the current stream. Only graphs on that stream are ordered after it. Each new stream gets a
+# new id, so the cache is an LRU of fixed size. An evicted tensor is released as the per-call
+# tensor was before. The cache is process-wide. With more than 16 keys in use, each call can miss
+# and upload a new tensor again. The results stay the same.
+_SHARD_INDEX_CACHE_SIZE = 16
+
+
+def _current_stream_id(device: str) -> int | None:
+    """Return the id of the current stream on a Neuron ``device``, ``None`` for other devices."""
+    if torch.device(device).type != "neuron":
+        return None
+    return torch.neuron.current_stream(device).stream_id
+
+
+@functools.lru_cache(maxsize=_SHARD_INDEX_CACHE_SIZE)
+def _shard_index_on(device: str, stream_id: int | None, shard_index: int) -> torch.Tensor:
+    return torch.tensor(shard_index, dtype=torch.int64, device=device)
+
+
+def _shard_index_tensor(index, device, params, original_inputs):
+    """Return the cached int64 scalar tensor holding ``params["shard_index"]`` on ``device``."""
+    # Stream ids repeat across devices, so a key without the device index can match another device.
+    device = torch.device(device)
+    if device.type == "neuron" and device.index is None:
+        device = torch.device("neuron", torch.neuron.current_device())
+    device = str(device)
+    return _shard_index_on(device, _current_stream_id(device), int(params["shard_index"]))
+
+
 TRANSFORM_REGISTRY: dict[str, Callable[[int, str, dict, list], Any]] = {
     "none": lambda index, device, params, original_inputs: None,
-    "shard_index": lambda index, device, params, original_inputs: torch.tensor(
-        params["shard_index"], dtype=torch.int64, device=device
-    ),
+    "shard_index": _shard_index_tensor,
     "input_passthrough": lambda index, device, params, original_inputs: (
         original_inputs[params["index_to_input"][index]] if original_inputs is not None else None
     ),
