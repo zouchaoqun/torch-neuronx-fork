@@ -313,16 +313,20 @@ def test_apply_input_mutations_shard_index_compiled_eviction():
         passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": k})])]
         return add(x, apply_input_mutations(["a", "b"], passes, device)[2])
 
-    created, read_done = torch.neuron.Stream(), torch.neuron.Event()
+    # The check reads an event 32 matmuls ahead of the read. An event after the read can still
+    # be pending when the read has run. A stream has no hold that the host releases: a wait on
+    # an event not yet recorded does not wait.
+    created, ahead_of_read = torch.neuron.Stream(), torch.neuron.Event()
     with torch.neuron.stream(created):
         out = busy
-        for _ in range(64):
+        for i in range(64):
+            if i == 32:
+                ahead_of_read.record()
             out = matmul(out)
         outputs = [read(0)]
-        read_done.record()
     # Key 0 is the oldest of these keys, so the last of them evicts it.
     outputs += [read(k) for k in range(1, io_mutation._SHARD_INDEX_CACHE_SIZE + 1)]
-    queued_at_eviction = not read_done.query()
+    queued_at_eviction = not ahead_of_read.query()
     torch.neuron.synchronize()
     for k, output in enumerate(outputs):
         assert torch.equal(output.cpu(), torch.arange(4, dtype=torch.float32) + k)
