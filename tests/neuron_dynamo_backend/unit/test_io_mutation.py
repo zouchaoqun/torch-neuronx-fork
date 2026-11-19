@@ -15,6 +15,7 @@ import weakref
 
 import pytest
 import torch
+from torch._dispatch.python import enable_python_dispatcher
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch._subclasses.functional_tensor import FunctionalTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -227,15 +228,14 @@ def cache_on_cpu(monkeypatch):
 
 
 def _pre_dispatch_functional_trace(fn, x):
-    # AOTAutograd's pre-dispatch functionalization on real tensors. Both modes sit on the
-    # pre-dispatch stack, so the ordinary dispatch stack stays empty.
-    def traced(tokens):
-        with FunctionalTensorMode(pre_dispatch=True):
-            return fn(tokens)
-
-    return make_fx(traced, pre_dispatch=True)(x)
+    # Pre-dispatch functionalization on real tensors. FunctionalTensorMode(pre_dispatch=True)
+    # and make_fx's pre-dispatch tracing sit on the pre-dispatch stack, so the ordinary dispatch
+    # stack stays empty.
+    with enable_python_dispatcher(), FunctionalTensorMode(pre_dispatch=True):
+        return make_fx(fn, pre_dispatch=True)(x)
 
 
+@pytest.mark.parametrize("warm", [False, True], ids=["empty", "warm"])
 @pytest.mark.parametrize("cached_types", [{"neuron"}, {"neuron", "cpu"}], ids=["neuron", "cpu"])
 @pytest.mark.parametrize(
     "trace",
@@ -246,9 +246,11 @@ def _pre_dispatch_functional_trace(fn, x):
     ],
     ids=["fake", "functionalize", "pre_dispatch"],
 )
-def test_apply_input_mutations_shard_index_trace_then_run(monkeypatch, cached_types, trace):
-    # Trace the CPU fallback, then run it with real tokens. The real run must not get the
-    # tensor made while tracing. With CPU in the cached types, only the mode check prevents it.
+def test_apply_input_mutations_shard_index_trace_then_run(monkeypatch, cached_types, trace, warm):
+    # Trace the CPU fallback, then run it with real tokens. The trace must not read or fill the
+    # cache, and the real run must not get the tensor made while tracing. With CPU in the cached
+    # types, only the mode checks prevent it. "warm" fills the cache with an eager call first: a
+    # trace that reads the cache then gets the real tensor, so only cache_info() shows it.
     monkeypatch.setattr(
         io_mutation, "_SHARD_INDEX_CACHE_DEVICE_TYPES", frozenset(cached_types), raising=False
     )
@@ -258,7 +260,11 @@ def test_apply_input_mutations_shard_index_trace_then_run(monkeypatch, cached_ty
 
     passes = [pm("P", in_muts=[inp_add([1], "shard_index", {"shard_index": 1})])]
     fallback = backend._make_fallback_fn(torch.fx.symbolic_trace(vocab_mask), passes)
+    if warm:
+        assert fallback([torch.tensor([1, 5, 9])])[0].tolist() == [False, True, False]
+    before = io_mutation._shard_index_on.cache_info()
     trace(lambda tokens: fallback([tokens]), torch.tensor([1, 5, 9]))
+    assert io_mutation._shard_index_on.cache_info() == before
     assert fallback([torch.tensor([1, 5, 9])])[0].tolist() == [False, True, False]
 
 
