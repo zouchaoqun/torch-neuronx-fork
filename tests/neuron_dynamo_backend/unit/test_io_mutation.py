@@ -319,8 +319,8 @@ def test_apply_input_mutations_shard_index_compiled_eviction():
     created, ahead_of_read = torch.neuron.Stream(), torch.neuron.Event()
     with torch.neuron.stream(created):
         out = busy
-        for i in range(64):
-            if i == 32:
+        for i in range(96):
+            if i == 64:
                 ahead_of_read.record()
             out = matmul(out)
         outputs = [read(0)]
