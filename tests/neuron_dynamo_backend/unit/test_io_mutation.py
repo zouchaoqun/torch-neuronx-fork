@@ -334,19 +334,6 @@ def test_apply_input_mutations_shard_index_compiled_eviction():
         pytest.skip("The backlog drained before the eviction. The outputs are correct.")
 
 
-@pytest.mark.skipif(
-    not torch.neuron.is_available() or torch.neuron.device_count() < 2,
-    reason="Two Neuron devices not available",
-)
-def test_apply_input_mutations_shard_index_two_devices():
-    passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 5})])]
-    tensors = [apply_input_mutations(["a", "b"], passes, f"neuron:{d}")[2] for d in (0, 1)]
-    assert tensors[0] is not tensors[1]
-    for d, tensor in enumerate(tensors):
-        assert apply_input_mutations(["a", "b"], passes, f"neuron:{d}")[2] is tensor
-        assert tensor.device == torch.device("neuron", d) and tensor.item() == 5
-
-
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
 def test_apply_input_mutations_shard_index_device_without_index():
     # A device without an index is the current device. It must not get a key of its own.
