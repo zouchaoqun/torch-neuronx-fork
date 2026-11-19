@@ -208,6 +208,15 @@ def test_apply_input_mutations_add_shard():
     assert apply_input_mutations(["a", "b"], passes, "cpu")[2] is not result[2]
 
 
+@pytest.fixture(autouse=True)
+def empty_shard_index_cache():
+    # Each test starts with an empty cache. An entry left by an earlier test can stand in for the
+    # one a test makes, and hide a missing mode check.
+    io_mutation._shard_index_on.cache_clear()
+    yield
+    io_mutation._shard_index_on.cache_clear()
+
+
 @pytest.fixture
 def cache_on_cpu(monkeypatch):
     # Real execution reuses the tensor only on Neuron. These cache tests run on CPU.
