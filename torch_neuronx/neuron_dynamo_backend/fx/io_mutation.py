@@ -125,12 +125,15 @@ def _shard_index_on(device: str, stream_id: int | None, shard_index: int) -> tor
 def _reuse_shard_index(device: torch.device) -> bool:
     """Return whether a call on ``device`` can reuse the cached tensor."""
     # A trace, fake or functional mode makes its own kind of tensor. A real call must not get it.
-    # These checks read this thread's dispatch mode stack and functorch transforms.
-    # is_in_torch_dispatch_mode() reads a process-wide flag: when one of two threads in a mode
-    # exits, it is False in the other.
+    # These checks read this thread's dispatch mode stack, its PreDispatch key and functorch
+    # transforms. is_in_torch_dispatch_mode() reads a process-wide flag: when one of two threads
+    # in a mode exits, it is False in the other. A pre-dispatch mode such as
+    # FunctionalTensorMode(pre_dispatch=True) sits on a separate stack, also process-wide, so the
+    # check is the PreDispatch key in this thread's include set.
     return (
         device.type in _SHARD_INDEX_CACHE_DEVICE_TYPES
         and torch._C._len_torch_dispatch_stack() == 0
+        and not torch._C._dispatch_tls_is_dispatch_key_included(torch._C.DispatchKey.PreDispatch)
         and not torch._C._are_functorch_transforms_active()
         and not torch.compiler.is_compiling()
     )

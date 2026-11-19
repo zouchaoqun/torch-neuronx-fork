@@ -16,6 +16,7 @@ import weakref
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+from torch._subclasses.functional_tensor import FunctionalTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils import _python_dispatch
 
@@ -225,14 +226,25 @@ def cache_on_cpu(monkeypatch):
     )
 
 
+def _pre_dispatch_functional_trace(fn, x):
+    # AOTAutograd's pre-dispatch functionalization on real tensors. Both modes sit on the
+    # pre-dispatch stack, so the ordinary dispatch stack stays empty.
+    def traced(tokens):
+        with FunctionalTensorMode(pre_dispatch=True):
+            return fn(tokens)
+
+    return make_fx(traced, pre_dispatch=True)(x)
+
+
 @pytest.mark.parametrize("cached_types", [{"neuron"}, {"neuron", "cpu"}], ids=["neuron", "cpu"])
 @pytest.mark.parametrize(
     "trace",
     [
         lambda fn, x: make_fx(fn, tracing_mode="fake")(x),
         lambda fn, x: torch.func.functionalize(fn)(x),
+        _pre_dispatch_functional_trace,
     ],
-    ids=["fake", "functionalize"],
+    ids=["fake", "functionalize", "pre_dispatch"],
 )
 def test_apply_input_mutations_shard_index_trace_then_run(monkeypatch, cached_types, trace):
     # Trace the CPU fallback, then run it with real tokens. The real run must not get the
