@@ -28,6 +28,7 @@ from enum import Enum
 from typing import Any
 
 import torch
+from torch.utils._python_dispatch import is_in_torch_dispatch_mode
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,8 @@ class PassMutations:
 # tensor was before. The cache is process-wide. With more than 16 keys in use, each call can miss
 # and upload a new tensor again. The results stay the same.
 _SHARD_INDEX_CACHE_SIZE = 16
+# Only real execution on these devices reuses the tensor. The CPU fallback gets a new one.
+_SHARD_INDEX_CACHE_DEVICE_TYPES = frozenset({"neuron"})
 
 
 def _current_stream_id(device: str) -> int | None:
@@ -120,10 +123,23 @@ def _shard_index_on(device: str, stream_id: int | None, shard_index: int) -> tor
     return torch.tensor(shard_index, dtype=torch.int64, device=device)
 
 
+def _reuse_shard_index(device: torch.device) -> bool:
+    """Return whether a call on ``device`` can reuse the cached tensor."""
+    # A trace, fake or functional mode makes its own kind of tensor. A real call must not get it.
+    return (
+        device.type in _SHARD_INDEX_CACHE_DEVICE_TYPES
+        and not is_in_torch_dispatch_mode()
+        and not torch._C._are_functorch_transforms_active()
+        and not torch.compiler.is_compiling()
+    )
+
+
 def _shard_index_tensor(index, device, params, original_inputs):
-    """Return the cached int64 scalar tensor holding ``params["shard_index"]`` on ``device``."""
-    # Stream ids repeat across devices, so a key without the device index can match another device.
+    """Return the int64 scalar tensor holding ``params["shard_index"]`` on ``device``."""
     device = torch.device(device)
+    if not _reuse_shard_index(device):
+        return torch.tensor(params["shard_index"], dtype=torch.int64, device=device)
+    # Stream ids repeat across devices, so a key without the device index can match another device.
     if device.type == "neuron" and device.index is None:
         device = torch.device("neuron", torch.neuron.current_device())
     device = str(device)
