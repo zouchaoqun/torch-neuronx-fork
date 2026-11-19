@@ -28,7 +28,6 @@ from enum import Enum
 from typing import Any
 
 import torch
-from torch.utils._python_dispatch import is_in_torch_dispatch_mode
 
 logger = logging.getLogger(__name__)
 
@@ -126,9 +125,12 @@ def _shard_index_on(device: str, stream_id: int | None, shard_index: int) -> tor
 def _reuse_shard_index(device: torch.device) -> bool:
     """Return whether a call on ``device`` can reuse the cached tensor."""
     # A trace, fake or functional mode makes its own kind of tensor. A real call must not get it.
+    # These checks read this thread's dispatch mode stack and functorch transforms.
+    # is_in_torch_dispatch_mode() reads a process-wide flag: when one of two threads in a mode
+    # exits, it is False in the other.
     return (
         device.type in _SHARD_INDEX_CACHE_DEVICE_TYPES
-        and not is_in_torch_dispatch_mode()
+        and torch._C._len_torch_dispatch_stack() == 0
         and not torch._C._are_functorch_transforms_active()
         and not torch.compiler.is_compiling()
     )

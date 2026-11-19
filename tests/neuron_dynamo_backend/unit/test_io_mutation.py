@@ -10,11 +10,14 @@ Organised into:
 """
 
 import gc
+import threading
 import weakref
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.utils import _python_dispatch
 
 from torch_neuronx.neuron_dynamo_backend import backend
 from torch_neuronx.neuron_dynamo_backend.fx import io_mutation
@@ -236,6 +239,74 @@ def test_apply_input_mutations_shard_index_trace_then_run(monkeypatch, cached_ty
     fallback = backend._make_fallback_fn(torch.fx.symbolic_trace(vocab_mask), passes)
     trace(lambda tokens: fallback([tokens]), torch.tensor([1, 5, 9]))
     assert fallback([torch.tensor([1, 5, 9])])[0].tolist() == [False, True, False]
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "neuron",
+            marks=pytest.mark.skipif(
+                not torch.neuron.is_available(), reason="Neuron not available"
+            ),
+        ),
+    ],
+)
+@pytest.mark.usefixtures("cache_on_cpu")
+def test_apply_input_mutations_shard_index_fake_mode_in_other_thread(monkeypatch, device):
+    # Two threads enter FakeTensorMode and the first exits. The first then calls outside any mode
+    # while the second is still in its mode. Neither call may get the other's kind of tensor.
+    # The exits leave torch's process-wide mode flags set; the test puts them back.
+    for name in ("_is_in_torch_dispatch_mode", "_is_in_non_infra_torch_dispatch_mode"):
+        monkeypatch.setattr(_python_dispatch, name, getattr(_python_dispatch, name))
+    if device == "neuron":
+        device = f"neuron:{torch.neuron.current_device()}"
+    passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 2})])]
+    steps = {name: threading.Event() for name in ("a_in", "b_in", "a_out", "b_got", "a_got")}
+    results, errors = {}, []
+
+    def wait(name):
+        assert steps[name].wait(30), f"timed out waiting for {name}"
+
+    def first():
+        with FakeTensorMode():
+            steps["a_in"].set()
+            wait("b_in")
+        steps["a_out"].set()
+        wait("b_got")
+        results["first"] = apply_input_mutations(["a", "b"], passes, device)[2]
+        steps["a_got"].set()
+
+    def second():
+        wait("a_in")
+        with FakeTensorMode():
+            steps["b_in"].set()
+            wait("a_out")
+            results["second"] = apply_input_mutations(["a", "b"], passes, device)[2]
+            steps["b_got"].set()
+            wait("a_got")
+
+    def run(fn):
+        try:
+            fn()
+        except BaseException as e:
+            errors.append(e)
+            for step in steps.values():
+                step.set()
+
+    threads = [threading.Thread(target=run, args=(fn,)) for fn in (first, second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+    assert not errors, errors
+    assert not any(thread.is_alive() for thread in threads)
+    assert isinstance(results["second"], FakeTensor)
+    real = results["first"]
+    assert not isinstance(real, FakeTensor)
+    assert real.device == torch.device(device) and real.item() == 2
+    assert apply_input_mutations(["a", "b"], passes, device)[2] is real
 
 
 @pytest.mark.usefixtures("cache_on_cpu")
