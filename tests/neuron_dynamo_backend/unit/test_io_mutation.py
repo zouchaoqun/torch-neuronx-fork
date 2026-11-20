@@ -561,11 +561,14 @@ def test_executor_reuses_injected_shard_index():
 
     passes = [pm("ShardIndexInjection", in_muts=[inp_add([1], "shard_index", {"shard_index": 3})])]
     io = FunctionIO(
-        inputs=[TensorSpec(dtype="float32", shape=[4]), TensorSpec(dtype="int32", shape=[])],
-        outputs=[TensorSpec(dtype="float32", shape=[4])],
+        inputs=[
+            TensorSpec(dtype=torch.float32, shape=(4,)),
+            TensorSpec(dtype=torch.int32, shape=()),
+        ],
+        outputs=[TensorSpec(dtype=torch.float32, shape=(4,))],
     )
     executor = Executor(
-        "g", "k", io, [TensorSpec(dtype="float32", shape=[4])], pass_mutations=passes
+        "g", "k", io, [TensorSpec(dtype=torch.float32, shape=(4,))], pass_mutations=passes
     )
     device = f"neuron:{torch.neuron.current_device()}"
     x = torch.zeros(4, device=device)
