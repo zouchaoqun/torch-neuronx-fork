@@ -220,12 +220,50 @@ def empty_shard_index_cache():
     io_mutation._shard_index_on.cache_clear()
 
 
+def inject(inputs, passes, device):
+    # The shard index as the executor injects it: with the cached transform.
+    return apply_input_mutations(inputs, passes, device, io_mutation._EXECUTOR_INPUT_TRANSFORMS)
+
+
 @pytest.fixture
 def cache_on_cpu(monkeypatch):
     # Real execution reuses the tensor only on Neuron. These cache tests run on CPU.
     monkeypatch.setattr(
         io_mutation, "_SHARD_INDEX_CACHE_DEVICE_TYPES", frozenset({"neuron", "cpu"})
     )
+
+
+@pytest.mark.usefixtures("cache_on_cpu")
+@pytest.mark.parametrize(
+    "make",
+    [
+        lambda: io_mutation.TRANSFORM_REGISTRY["shard_index"](0, "cpu", {"shard_index": 5}, None),
+        lambda: apply_input_mutations(
+            ["a"], [pm("P", in_muts=[inp_add([1], "shard_index", {"shard_index": 5})])], "cpu"
+        )[1],
+    ],
+    ids=["registry", "apply_input_mutations"],
+)
+def test_shard_index_transform_new_tensor_each_call(make):
+    # Only the executor reuses the tensor. A caller of the transform that changes the tensor it gets
+    # must not change the next call's: 5, changed to 17, then 5 again.
+    first = make()
+    first.fill_(17)
+    again = make()
+    assert again is not first and again.item() == 5
+    assert io_mutation._shard_index_on.cache_info().currsize == 0
+
+
+@pytest.mark.usefixtures("cache_on_cpu")
+def test_cpu_fallback_does_not_use_shard_index_cache():
+    def vocab_mask(tokens, shard_index):
+        return (tokens >= shard_index * 4) & (tokens < shard_index * 4 + 4)
+
+    passes = [pm("P", in_muts=[inp_add([1], "shard_index", {"shard_index": 1})])]
+    fallback = backend._make_fallback_fn(torch.fx.symbolic_trace(vocab_mask), passes)
+    for _ in range(2):
+        assert fallback([torch.tensor([1, 5, 9])])[0].tolist() == [False, True, False]
+    assert io_mutation._shard_index_on.cache_info().currsize == 0
 
 
 def _pre_dispatch_functional_trace(fn, x):
@@ -313,10 +351,11 @@ def _device_constructor_mode(fn, x):
     ],
 )
 def test_apply_input_mutations_shard_index_trace_then_run(monkeypatch, cached_types, trace, warm):
-    # Trace the CPU fallback, then run it with real tokens. The trace must not read or fill the
-    # cache, and the real run must not get the tensor made while tracing. With CPU in the cached
-    # types, only the mode checks prevent it. "warm" fills the cache with an eager call first: a
-    # trace that reads the cache then gets the real tensor, so only cache_info() shows it.
+    # Trace the graph with the shard index injected as the executor injects it, then run it with
+    # real tokens. The trace must not read or fill the cache, and the real run must not get the
+    # tensor made while tracing. With CPU in the cached types, only the mode checks prevent it.
+    # "warm" fills the cache with an eager call first: a trace that reads the cache then gets the
+    # real tensor, so only cache_info() shows it.
     monkeypatch.setattr(
         io_mutation, "_SHARD_INDEX_CACHE_DEVICE_TYPES", frozenset(cached_types), raising=False
     )
@@ -325,13 +364,17 @@ def test_apply_input_mutations_shard_index_trace_then_run(monkeypatch, cached_ty
         return (tokens >= shard_index * 4) & (tokens < shard_index * 4 + 4)
 
     passes = [pm("P", in_muts=[inp_add([1], "shard_index", {"shard_index": 1})])]
-    fallback = backend._make_fallback_fn(torch.fx.symbolic_trace(vocab_mask), passes)
+    gm = torch.fx.symbolic_trace(vocab_mask)
+
+    def run(inputs):
+        return (gm(*inject(list(inputs), passes, "cpu")),)
+
     if warm:
-        assert fallback([torch.tensor([1, 5, 9])])[0].tolist() == [False, True, False]
+        assert run([torch.tensor([1, 5, 9])])[0].tolist() == [False, True, False]
     before = io_mutation._shard_index_on.cache_info()
-    trace(lambda tokens: fallback([tokens]), torch.tensor([1, 5, 9]))
+    trace(lambda tokens: run([tokens]), torch.tensor([1, 5, 9]))
     assert io_mutation._shard_index_on.cache_info() == before
-    assert fallback([torch.tensor([1, 5, 9])])[0].tolist() == [False, True, False]
+    assert run([torch.tensor([1, 5, 9])])[0].tolist() == [False, True, False]
 
 
 @pytest.mark.parametrize(
@@ -368,7 +411,7 @@ def test_apply_input_mutations_shard_index_fake_mode_in_other_thread(monkeypatch
             wait("b_in")
         steps["a_out"].set()
         wait("b_got")
-        results["first"] = apply_input_mutations(["a", "b"], passes, device)[2]
+        results["first"] = inject(["a", "b"], passes, device)[2]
         steps["a_got"].set()
 
     def second():
@@ -376,7 +419,7 @@ def test_apply_input_mutations_shard_index_fake_mode_in_other_thread(monkeypatch
         with FakeTensorMode():
             steps["b_in"].set()
             wait("a_out")
-            results["second"] = apply_input_mutations(["a", "b"], passes, device)[2]
+            results["second"] = inject(["a", "b"], passes, device)[2]
             steps["b_got"].set()
             wait("a_got")
 
@@ -399,28 +442,28 @@ def test_apply_input_mutations_shard_index_fake_mode_in_other_thread(monkeypatch
     real = results["first"]
     assert not isinstance(real, FakeTensor)
     assert real.device == torch.device(device) and real.item() == 2
-    assert apply_input_mutations(["a", "b"], passes, device)[2] is real
+    assert inject(["a", "b"], passes, device)[2] is real
 
 
 @pytest.mark.usefixtures("cache_on_cpu")
 def test_apply_input_mutations_shard_index_reused():
     passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 3})])]
-    first = apply_input_mutations(["a", "b"], passes, "cpu")[2]
-    second = apply_input_mutations(["a", "b"], passes, "cpu")[2]
+    first = inject(["a", "b"], passes, "cpu")[2]
+    second = inject(["a", "b"], passes, "cpu")[2]
     assert first is second and first.dtype == torch.int64 and first.item() == 3
     other = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 4})])]
-    assert apply_input_mutations(["a", "b"], other, "cpu")[2].item() == 4
+    assert inject(["a", "b"], other, "cpu")[2].item() == 4
 
 
 @pytest.mark.usefixtures("cache_on_cpu")
 def test_apply_input_mutations_shard_index_per_stream(monkeypatch):
     passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 6})])]
     monkeypatch.setattr(io_mutation, "_current_stream_id", lambda device: 1)
-    first = apply_input_mutations(["a", "b"], passes, "cpu")[2]
+    first = inject(["a", "b"], passes, "cpu")[2]
     monkeypatch.setattr(io_mutation, "_current_stream_id", lambda device: 2)
-    second = apply_input_mutations(["a", "b"], passes, "cpu")[2]
+    second = inject(["a", "b"], passes, "cpu")[2]
     assert first is not second and second.item() == 6
-    assert apply_input_mutations(["a", "b"], passes, "cpu")[2] is second
+    assert inject(["a", "b"], passes, "cpu")[2] is second
 
 
 @pytest.mark.usefixtures("cache_on_cpu")
@@ -430,12 +473,12 @@ def test_apply_input_mutations_shard_index_stream_churn(monkeypatch):
     refs = []
     for stream_id in range(1000):
         monkeypatch.setattr(io_mutation, "_current_stream_id", lambda device, s=stream_id: s)
-        refs.append(weakref.ref(apply_input_mutations(["a", "b"], passes, "cpu")[2]))
+        refs.append(weakref.ref(inject(["a", "b"], passes, "cpu")[2]))
     gc.collect()
     size = io_mutation._SHARD_INDEX_CACHE_SIZE
     assert io_mutation._shard_index_on.cache_info().currsize <= size
     assert sum(r() is not None for r in refs) <= size
-    assert refs[-1]() is apply_input_mutations(["a", "b"], passes, "cpu")[2]
+    assert refs[-1]() is inject(["a", "b"], passes, "cpu")[2]
 
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
@@ -448,8 +491,8 @@ def test_apply_input_mutations_shard_index_two_neuron_streams():
     tensors = []
     for stream in streams:
         with torch.neuron.stream(stream):
-            tensors.append(apply_input_mutations(["a", "b"], passes, device)[2])
-            assert apply_input_mutations(["a", "b"], passes, device)[2] is tensors[-1]
+            tensors.append(inject(["a", "b"], passes, device)[2])
+            assert inject(["a", "b"], passes, device)[2] is tensors[-1]
     same_stream = streams[0].stream_id == streams[1].stream_id
     assert (tensors[0] is tensors[1]) == same_stream
     for stream, tensor in zip(streams, tensors, strict=True):
@@ -475,7 +518,7 @@ def test_apply_input_mutations_shard_index_compiled_eviction():
 
     def read(k):
         passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": k})])]
-        return add(x, apply_input_mutations(["a", "b"], passes, device)[2])
+        return add(x, inject(["a", "b"], passes, device)[2])
 
     # The check reads an event 32 matmuls ahead of the read. An event after the read can still
     # be pending when the read has run. A stream has no hold that the host releases: a wait on
@@ -503,8 +546,38 @@ def test_apply_input_mutations_shard_index_device_without_index():
     # A device without an index is the current device. It must not get a key of its own.
     passes = [pm("P", in_muts=[inp_add([2], "shard_index", {"shard_index": 9})])]
     device = f"neuron:{torch.neuron.current_device()}"
-    tensor = apply_input_mutations(["a", "b"], passes, device)[2]
-    assert apply_input_mutations(["a", "b"], passes, "neuron")[2] is tensor
+    tensor = inject(["a", "b"], passes, device)[2]
+    assert inject(["a", "b"], passes, "neuron")[2] is tensor
+
+
+@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
+def test_executor_reuses_injected_shard_index():
+    # The executor injects the shard index with the cached transform. Two calls with the same
+    # device, stream and shard index pass the graph the same tensor.
+    from unittest.mock import patch
+
+    from torch_neuronx.neuron_dynamo_backend.executor import Executor
+    from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import FunctionIO, TensorSpec
+
+    passes = [pm("ShardIndexInjection", in_muts=[inp_add([1], "shard_index", {"shard_index": 3})])]
+    io = FunctionIO(
+        inputs=[TensorSpec(dtype="float32", shape=[4]), TensorSpec(dtype="int32", shape=[])],
+        outputs=[TensorSpec(dtype="float32", shape=[4])],
+    )
+    executor = Executor(
+        "g", "k", io, [TensorSpec(dtype="float32", shape=[4])], pass_mutations=passes
+    )
+    device = f"neuron:{torch.neuron.current_device()}"
+    x = torch.zeros(4, device=device)
+    seen = []
+    with patch(
+        "torch_neuronx._C.execute_compiled_graph",
+        lambda name, key, inputs, outputs, collectives: seen.append(inputs[1].data_ptr()),
+    ):
+        executor(x)
+        executor(x)
+    cached = io_mutation._shard_index_on(device, io_mutation._current_stream_id(device), 3)
+    assert seen == [cached.data_ptr()] * 2
 
 
 def test_apply_input_mutations_multi_pass():
