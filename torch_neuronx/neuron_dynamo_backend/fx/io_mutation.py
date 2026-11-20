@@ -125,19 +125,17 @@ def _shard_index_on(device: str, stream_id: int | None, shard_index: int) -> tor
 def _reuse_shard_index(device: torch.device) -> bool:
     """Return whether a call on ``device`` can reuse the cached tensor."""
     # A trace, fake or functional mode makes its own kind of tensor. A real call must not get it.
-    # These checks read this thread's dispatch mode stack, its PreDispatch and Functionalize keys,
-    # its torch function modes and functorch transforms. is_in_torch_dispatch_mode() reads a
-    # process-wide flag: when one of two threads in a mode exits, it is False in the other. A
-    # pre-dispatch mode such as FunctionalTensorMode(pre_dispatch=True) sits on a separate stack,
-    # also process-wide, so the check is the PreDispatch key in this thread's include set. Native
-    # functionalization adds the Functionalize key. Under any torch function mode, torch.device()
-    # and set_default_device() included, a call gets a new tensor, as without the cache.
+    # These checks read this thread's dispatch mode stack, its PreDispatch and Functionalize keys
+    # and functorch transforms. is_in_torch_dispatch_mode() reads a process-wide flag: when one of
+    # two threads in a mode exits, it is False in the other. A pre-dispatch mode such as
+    # FunctionalTensorMode(pre_dispatch=True) sits on a separate stack, also process-wide, so the
+    # check is the PreDispatch key in this thread's include set. Native functionalization adds the
+    # Functionalize key. The caller checks for torch function modes before it builds ``device``.
     return (
         device.type in _SHARD_INDEX_CACHE_DEVICE_TYPES
         and torch._C._len_torch_dispatch_stack() == 0
         and not torch._C._dispatch_tls_is_dispatch_key_included(torch._C.DispatchKey.PreDispatch)
         and not torch._C._dispatch_tls_is_dispatch_key_included(torch._C.DispatchKey.Functionalize)
-        and not torch._C._is_torch_function_mode_enabled()
         and not torch._C._are_functorch_transforms_active()
         and not torch.compiler.is_compiling()
     )
@@ -145,6 +143,11 @@ def _reuse_shard_index(device: torch.device) -> bool:
 
 def _shard_index_tensor(index, device, params, original_inputs):
     """Return the int64 scalar tensor holding ``params["shard_index"]`` on ``device``."""
+    # A torch function mode can intercept torch.device() itself, so this check comes first. Under
+    # any such mode, torch.device() and set_default_device() included, a call gets a new tensor made
+    # from the original argument, as without the cache.
+    if torch._C._is_torch_function_mode_enabled():
+        return torch.tensor(params["shard_index"], dtype=torch.int64, device=device)
     device = torch.device(device)
     if not _reuse_shard_index(device):
         return torch.tensor(params["shard_index"], dtype=torch.int64, device=device)

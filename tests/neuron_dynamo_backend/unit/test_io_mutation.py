@@ -270,6 +270,23 @@ def _torch_function_mode(fn, x):
         return fn(x)
 
 
+class _CpuDeviceToMeta(TorchFunctionMode):
+    # Turns torch.device("cpu") into the meta device. torch.tensor's own device argument is not
+    # intercepted, so a call that keeps the original argument still makes its tensor on the CPU.
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        if func is torch.device and args and args[0] == "cpu":
+            return torch.device("meta")
+        return func(*args, **(kwargs or {}))
+
+
+def _device_constructor_mode(fn, x):
+    # A mode that intercepts torch.device(): the mask under the mode must still be right.
+    with _CpuDeviceToMeta():
+        out = fn(x)
+    assert out[0].device == x.device and out[0].tolist() == [False, True, False]
+    return out
+
+
 @pytest.mark.parametrize("warm", [False, True], ids=["empty", "warm"])
 @pytest.mark.parametrize("cached_types", [{"neuron"}, {"neuron", "cpu"}], ids=["neuron", "cpu"])
 @pytest.mark.parametrize(
@@ -282,6 +299,7 @@ def _torch_function_mode(fn, x):
         _pre_dispatch_mode,
         _native_functionalization,
         _torch_function_mode,
+        _device_constructor_mode,
     ],
     ids=[
         "fake",
@@ -291,6 +309,7 @@ def _torch_function_mode(fn, x):
         "pre_dispatch_mode",
         "native_functionalization",
         "torch_function_mode",
+        "device_constructor_mode",
     ],
 )
 def test_apply_input_mutations_shard_index_trace_then_run(monkeypatch, cached_types, trace, warm):
