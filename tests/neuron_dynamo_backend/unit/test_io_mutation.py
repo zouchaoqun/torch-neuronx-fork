@@ -19,6 +19,7 @@ from torch._dispatch.python import enable_python_dispatcher
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch._subclasses.functional_tensor import FunctionalTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.overrides import TorchFunctionMode
 from torch.utils import _python_dispatch
 
 from torch_neuronx.neuron_dynamo_backend import backend
@@ -235,6 +236,40 @@ def _pre_dispatch_functional_trace(fn, x):
         return make_fx(fn, pre_dispatch=True)(x)
 
 
+def _fake_mode(fn, x):
+    # FakeTensorMode alone: on the dispatch mode stack, with no torch function mode.
+    with FakeTensorMode() as mode:
+        return fn(mode.from_tensor(x))
+
+
+def _pre_dispatch_mode(fn, x):
+    # FunctionalTensorMode(pre_dispatch=True) alone: the PreDispatch key, with no torch function
+    # mode (make_fx's pre-dispatch tracing adds one).
+    with enable_python_dispatcher(), FunctionalTensorMode(pre_dispatch=True):
+        return fn(x)
+
+
+def _native_functionalization(fn, x):
+    # Functionalization without a mode: the Functionalize key in this thread's include set.
+    torch._enable_functionalization(reapply_views=True)
+    try:
+        return fn(torch._to_functional_tensor(x))
+    finally:
+        torch._disable_functionalization()
+
+
+class _WrapNewTensors(TorchFunctionMode):
+    # Wraps each tensor that torch.tensor makes. The dispatch mode stack and keys stay empty.
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        return torch._to_functional_tensor(out) if func is torch.tensor else out
+
+
+def _torch_function_mode(fn, x):
+    with _WrapNewTensors():
+        return fn(x)
+
+
 @pytest.mark.parametrize("warm", [False, True], ids=["empty", "warm"])
 @pytest.mark.parametrize("cached_types", [{"neuron"}, {"neuron", "cpu"}], ids=["neuron", "cpu"])
 @pytest.mark.parametrize(
@@ -243,8 +278,20 @@ def _pre_dispatch_functional_trace(fn, x):
         lambda fn, x: make_fx(fn, tracing_mode="fake")(x),
         lambda fn, x: torch.func.functionalize(fn)(x),
         _pre_dispatch_functional_trace,
+        _fake_mode,
+        _pre_dispatch_mode,
+        _native_functionalization,
+        _torch_function_mode,
     ],
-    ids=["fake", "functionalize", "pre_dispatch"],
+    ids=[
+        "fake",
+        "functionalize",
+        "pre_dispatch",
+        "fake_mode",
+        "pre_dispatch_mode",
+        "native_functionalization",
+        "torch_function_mode",
+    ],
 )
 def test_apply_input_mutations_shard_index_trace_then_run(monkeypatch, cached_types, trace, warm):
     # Trace the CPU fallback, then run it with real tokens. The trace must not read or fill the
