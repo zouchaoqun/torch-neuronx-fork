@@ -144,11 +144,21 @@ def _reuse_shard_index(device: torch.device) -> bool:
     )
 
 
+def _new_shard_index_tensor(index, device, params, original_inputs):
+    """Return a new int64 scalar tensor holding ``params["shard_index"]`` on ``device``."""
+    return torch.tensor(params["shard_index"], dtype=torch.int64, device=device)
+
+
 def _cached_shard_index_tensor(index, device, params, original_inputs):
     """Return the cached int64 scalar tensor holding ``params["shard_index"]`` on ``device``."""
-    # A torch function mode can intercept torch.device() itself, so this check comes first. Under
-    # any such mode, torch.device() and set_default_device() included, a call gets a new tensor made
-    # from the original argument, as without the cache.
+    # A caller that replaces TRANSFORM_REGISTRY["shard_index"] gets its factory here too, as
+    # without the cache: the executor and the CPU fallback inject the same value.
+    factory = TRANSFORM_REGISTRY["shard_index"]
+    if factory is not _new_shard_index_tensor:
+        return factory(index, device, params, original_inputs)
+    # A torch function mode can intercept torch.device() itself, so this check comes before it.
+    # Under any such mode, torch.device() and set_default_device() included, a call gets a new
+    # tensor made from the original argument, as without the cache.
     if torch._C._is_torch_function_mode_enabled():
         return torch.tensor(params["shard_index"], dtype=torch.int64, device=device)
     device = torch.device(device)
@@ -163,9 +173,7 @@ def _cached_shard_index_tensor(index, device, params, original_inputs):
 
 TRANSFORM_REGISTRY: dict[str, Callable[[int, str, dict, list], Any]] = {
     "none": lambda index, device, params, original_inputs: None,
-    "shard_index": lambda index, device, params, original_inputs: torch.tensor(
-        params["shard_index"], dtype=torch.int64, device=device
-    ),
+    "shard_index": _new_shard_index_tensor,
     "input_passthrough": lambda index, device, params, original_inputs: (
         original_inputs[params["index_to_input"][index]] if original_inputs is not None else None
     ),
@@ -185,7 +193,10 @@ def _apply_input_mutation(
         remove_set = set(m.indices)
         return [v for i, v in enumerate(values) if i not in remove_set]
     if m.kind == MutationKind.ADD:
-        fn = (transforms or {}).get(m.transform_key) or TRANSFORM_REGISTRY[m.transform_key]
+        if transforms is not None and m.transform_key in transforms:
+            fn = transforms[m.transform_key]
+        else:
+            fn = TRANSFORM_REGISTRY[m.transform_key]
         params = m.transform_params or {}
         add_set = set(m.indices)
         result = []
