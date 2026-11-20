@@ -81,9 +81,9 @@ class TestNeuronDevice(unittest.TestCase):
 
             # Device should be preserved
             assert x.device.index == device_idx
-            assert x.storage().device.index == device_idx, (
-                f"Device {device_idx}: Storage device changed to {x.storage().device}"
-            )
+            assert (
+                x.storage().device.index == device_idx
+            ), f"Device {device_idx}: Storage device changed to {x.storage().device}"
 
     def test_complex_conj_copy_across_devices(self):
         """A peer complex copy_ keeps the D2H/H2D route: the on-device path would
