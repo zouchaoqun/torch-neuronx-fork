@@ -653,7 +653,8 @@ def test_executor_uses_replaced_shard_index_transform(monkeypatch):
     # replacement's value, as without the cache, and leaves the cache alone.
     monkeypatch.setitem(io_mutation.TRANSFORM_REGISTRY, "shard_index", _seventeen_for_five)
     _, seen = _run_shard_index_executor(5)
-    assert [int(t.cpu()) for t in seen] == [17, 17]
+    # The graph gets the int64 scalar as a one-element tensor viewed as two int32 words.
+    assert [int(t.cpu().view(torch.int64)) for t in seen] == [17, 17]
     assert io_mutation._shard_index_on.cache_info().currsize == 0
 
 
